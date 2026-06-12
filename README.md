@@ -6,10 +6,10 @@ The core idea is intentionally narrow:
 
 1. Load Gemma 2 with Hugging Face Transformers.
 2. Wrap it with `SteeredGemma2`.
-3. Attach a PyTorch forward hook at a configurable decoder-layer point.
-4. Extract the batched last-token residual stream.
+3. Attach PyTorch forward hooks at configurable decoder-layer points.
+4. Extract the batched last-token residual stream at the classification hook.
 5. Send that activation to a `Steerer`.
-6. Add the returned batched steering vector back into the last-token residual stream.
+6. Cache the returned batched steering vector and add it back at the steering hook.
 7. Run generation or benchmark evaluation on the steered model.
 
 This repo is meant to stay small, readable, and easy to modify for interpretability research.
@@ -103,7 +103,7 @@ A `Steerer` must implement exactly one method:
 get_steering_vector(self, activation: torch.Tensor) -> torch.Tensor
 ```
 
-The `activation` is the last-token residual stream from the selected Gemma 2 layer.
+The `activation` is the last-token residual stream from the selected Gemma 2 classification layer.
 
 The shape is always batched:
 
@@ -240,13 +240,30 @@ steered_model = SteeredGemma2(
 )
 ```
 
+For separate classification and steering layers, keep the same `Steerer` and pass explicit classify/steer hook locations:
+
+```python
+steered_model = SteeredGemma2(
+    steerer,
+    model_name="google/gemma-2-2b",
+    classify_layer=12,
+    classify_hook_point="layer_output",
+    steer_layer=20,
+    steer_hook_point="layer_output",
+    device_map="auto",
+    torch_dtype=torch.bfloat16,
+)
+```
+
+The classification hook must run before the steering hook. In practice this means `classify_layer <= steer_layer`; if both hooks are on the same layer, `classify_hook_point` must not come after `steer_hook_point`.
+
 ---
 
 ## How `SteeredGemma2` uses a `Steerer`
 
-`SteeredGemma2` wraps a Gemma 2 causal language model and registers a forward hook on one part of a selected decoder layer.
+`SteeredGemma2` wraps a Gemma 2 causal language model and registers either one forward hook or two forward hooks. With the backward-compatible `layer` and `hook_point` arguments, classification and steering happen in the same hook. With the explicit `classify_*` and `steer_*` arguments, classification can happen at an earlier layer and steering can happen later.
 
-The core pattern is:
+The backward-compatible core pattern is:
 
 ```python
 from gemma2_steering import SteeredGemma2, ZeroSteerer
@@ -262,10 +279,24 @@ steered_model = SteeredGemma2(
 )
 ```
 
+The separate classify/steer pattern is:
+
+```python
+steered_model = SteeredGemma2(
+    steerer,
+    model_name="google/gemma-2-2b",
+    classify_layer=12,
+    classify_hook_point="layer_output",
+    steer_layer=20,
+    steer_hook_point="layer_output",
+    device_map="auto",
+)
+```
+
 During each forward pass:
 
-1. Gemma 2 computes the selected hooked module.
-2. The hook receives the module output.
+1. Gemma 2 computes the classification hooked module.
+2. The classify hook receives the module output.
 3. The wrapper extracts the last-token hidden state:
 
 ```python
@@ -278,13 +309,16 @@ activation = hidden[:, -1, :]
 steering = steerer.get_steering_vector(activation)
 ```
 
-5. The returned vector is added back to the last-token residual stream:
+5. The returned vector is cached until the steering hook fires.
+6. The steering hook adds the cached vector to the last-token residual stream:
 
 ```python
 hidden[:, -1, :] = hidden[:, -1, :] + steering
 ```
 
-6. The modified hidden state is returned to the rest of the model.
+7. The modified hidden state is returned to the rest of the model.
+
+The `Steerer` interface is unchanged. If the returned vector shape does not match the classification activation shape, or if the cached vector cannot be added to the steering activation shape, the wrapper raises an error. If steering is enabled but no classification hook has produced a vector, the wrapper also raises an error because that should indicate an invalid hook configuration or flag combination.
 
 This means steering is applied during normal `.forward(...)` calls and during `.generate(...)`.
 
@@ -318,31 +352,46 @@ hook_point="post_mlp"
 
 This attaches the hook after the layer’s MLP module.
 
-You can also move the hook after initialization:
+You can also move the hooks after initialization. The old aliases move both hooks together:
 
 ```python
 steered_model.attach_hook(layer=18, hook_point="layer_output")
 ```
 
+Or you can move them separately:
+
+```python
+steered_model.attach_hook(
+    classify_layer=12,
+    classify_hook_point="layer_output",
+    steer_layer=20,
+    steer_hook_point="layer_output",
+)
+```
+
 ---
 
-## Turning steering on and off
+## Turning classification and steering on and off
 
-Steering is enabled by default.
+Classification and steering are both enabled by default.
 
-To turn it off:
+To turn both off or on with the backward-compatible combined control:
 
 ```python
 steered_model.set_enabled(False)
-```
-
-To turn it back on:
-
-```python
 steered_model.set_enabled(True)
 ```
 
-You can also temporarily disable steering with a context manager:
+You can also control the two phases separately:
+
+```python
+steered_model.set_classification_enabled(True)
+steered_model.set_steering_enabled(False)
+```
+
+This lets you classify and create/log steering vectors without applying them. The reverse combination, classification disabled while steering is enabled, raises an error during the forward pass because the steering hook should never fire without a cached vector.
+
+You can temporarily disable only the steering application with a context manager:
 
 ```python
 with steered_model.without_steering():
@@ -351,7 +400,7 @@ with steered_model.without_steering():
 steered_out = steered_model.generate(**inputs, max_new_tokens=32)
 ```
 
-This is useful for comparing steered and unsteered behavior using the same in-memory model.
+This is useful for comparing steered and unsteered behavior using the same in-memory model while still exercising the classification hook.
 
 ---
 
@@ -462,5 +511,7 @@ The tests check the main steering behaviors:
 * `ZeroSteerer` preserves output shape;
 * `ConstantSteerer` enforces batched vectors;
 * steering changes the selected last-token activation;
-* disabling steering works;
-* the hook can be attached without loading Gemma 2.
+* disabling classification and steering works;
+* classification and steering can use separate hooks;
+* invalid classify-after-steer hook configurations are rejected;
+* the hooks can be attached without loading Gemma 2.
